@@ -1,23 +1,25 @@
 module HoboSort
 include("Extract.jl")
 include("Mixtures.jl")
+include("HoboPlot.jl")
 include("cholutils.jl")
-using Base.Dates, Base.LinAlg, Distributions, PDMats, MultivariateStats, PyPlot, .Extract, .Mixtures
+using Base.Dates, Base.LinAlg, Distributions, PDMats, .Extract, .Mixtures, .HoboPlot
 
 immutable SortParams
     init_period::Second
     inspect_period::Second
     history_period::Second
     min_cluster_size::Int
-    max_clusters::Int
+    initial_clusters::Int
     verbose::Bool
     plot::Bool
+    movie_file::UTF8String
 end
 SortParams(; init_period::TimePeriod=Minute(10), inspect_period::TimePeriod=Minute(5),
-           history_period::TimePeriod=Minute(10), min_cluster_size=120, max_clusters::Integer=10,
-           verbose::Bool=false, plot::Bool=false) = SortParams(init_period, inspect_period,
-                                                               history_period, min_cluster_size,
-                                                               max_clusters, verbose, plot)
+           history_period::TimePeriod=Minute(10), min_cluster_size=120, initial_clusters::Integer=10,
+           verbose::Bool=false, plot::Bool=false, movie_file::AbstractString="") =
+	SortParams(init_period, inspect_period, history_period, min_cluster_size, initial_clusters,
+		       verbose, plot, movie_file)
 
 type Cluster{T,S<:AbstractMatrix}
     active::Bool
@@ -34,6 +36,7 @@ type Cluster{T,S<:AbstractMatrix}
 end
 
 function Cluster{T}(wf::AbstractMatrix{T}, indexes::Vector{Int})
+	@assert issorted(indexes)
     n = length(indexes)
     cluster_wf = wf[:, indexes]
 
@@ -125,19 +128,13 @@ function prune!{T}(cluster::Cluster{T}, before::Int)
         LinAlg.copytri!(BLAS.syr!('U', -one(T), scratch, cluster.comoments), 'U')
         lowrankdowndate!(cluster.comoment_chol, scratch)
     end
+    @assert minimum(indexes) > before
 
     # Update everything else
     updatedist!(cluster)
 end
 
-function cluster_space(x)
-    # x = convert(Matrix{eltype(x)}, x)
-    # pca = fit(PCA, x, pratio=0.9, maxoutdim=3)
-    # pcs = transform(pca, x)
-    # pcs'
-    x
-end
-
+using PyPlot
 function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
     size(wf, 2) == length(times) || throw(ArgumentError("second dimension of wf must match times"))
     verbose = params.verbose
@@ -145,13 +142,50 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
     local means::Matrix{T}
     local covars::Array{T,3}
 
-    # Initialize using a GMM
+    pca_in = similar(wf)
+    rg = 1:searchsortedlast(times, first(times)+Int(params.history_period))
+    s = sum(sub(wf, :, rg), 2)
+    smax = maxabs(s)
+    clf()
+    n = length(rg)
+    for j = rg, k = 1:size(wf, 1)
+        pca_in[k, j] = (wf[k, j]*n-s[k])/smax
+    end
+    cur_first = 1
+    for j = last(rg)+1:size(wf, 2)
+        last_index = searchsortedlast(times, times[j]-Int(params.history_period))
+        while cur_first < last_index
+            for k = 1:size(wf, 1)
+                s[k] -= wf[k, cur_first]
+            end
+            cur_first += 1
+        end
+        n = j-cur_first+1
+        for k = 1:size(wf, 1)
+            s[k] += wf[k, j]
+        end
+        smax = maxabs(s)
+        for k = 1:size(wf, 1)
+            pca_in[k, j] = (wf[k, j]*n-s[k])/smax
+        end
+    end
+    C = Base.covzm(pca_in, vardim=2)
+    vals, vecs = eig(Symmetric(C))
+    reverse!(vals)
+    vecs = flipdim(vecs, 2)
+    nkeep = searchsortedfirst(cumsum(vals./sum(vals)), 0.9)
+    println("Using $nkeep PCs")
+    keepvecs = vecs[:, 1:nkeep]
+    cluster_space = keepvecs'*pca_in
+
+    # Initialize using free split-merge GMM
     verbose && println("Initializing Clusters...")
     init_rg = 1:searchsortedlast(times, first(times)+Int(params.init_period))
-    init_wf = sub(wf, :, init_rg)
-    init_wft = cluster_space(init_wf)
-    m = @time fsmem!(init_wft, verbose=:op)
-    # return m.m.components
+    init_wft = cluster_space[:, init_rg]
+    m = HardMixtureFit(Mixture(FullNormal, size(init_wft, 1), params.initial_clusters), init_wft; λ=0.01)
+    m = fsmem!(m)
+
+    # Drop clusters that are too small
     assignments_ = assignments(m)
     init_nclusters = length(m.m.components)
     verbose && println("Using $init_nclusters clusters")
@@ -172,16 +206,21 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
     clusters = Array(Cluster{T}, init_nclusters)
     for icluster = 1:length(clusters)
         indexes = find(assignments_ .== icluster)
-        clusters[icluster] = Cluster(wf, indexes)
+        clusters[icluster] = Cluster(cluster_space, indexes)
     end
 
     resize!(assignments_, size(wf, 2))
 
+    if params.plot
+        hp = HoboPlotter(params.movie_file)
+    end
+
     next_inspect = zero(eltype(times))
-    prune_index = 1
+    prune_index = 0
+    unif_ll = NaN
     for ispike = last(init_rg)+1:size(wf, 2)
         # TODO fix Distributions so this can use SubArrays
-        cur_wf = wf[:, ispike]
+        cur_wf = cluster_space[:, ispike]
         cur_time = times[ispike]
         last_prune_index = prune_index
         prune_index = searchsortedlast(times, cur_time - Int(params.history_period))
@@ -189,8 +228,13 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
         # See if we need to split/merge clusters
         if cur_time >= next_inspect
             println("Inspecting...")
-            rg = last_prune_index:ispike
-            rg_wft = cluster_space(wf[:, rg])
+            rg = last_prune_index+1:ispike-1
+            rg_wf = wf[:, rg]
+            rg_wft = cluster_space[:, rg]
+            mins = min(rg_wft, 2)
+            maxes = max(rg_wft, 2)
+            unif_ll = -sum(log(maxes .- mins))
+            @show unif_ll
 
             # Try splitting clusters
             changed = false
@@ -205,8 +249,8 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
 
                     # This is stupid, since it's a one component GMM
                     # mtest = em!(SoftMixtureFit(Mixture(size(wft, 1), 1), wft; λ=0.01, γ=Vector{Float64}[ones(length(indexes))]))
-                    mtest = em!(HardMixtureFit(Mixture(size(wft, 1), 1), wft; λ=0.01, assignments=ones(UInt8, length(indexes))))
-                    msplit = split(mtest, verbose=:op)
+                    mtest = em!(HardMixtureFit(Mixture(FullNormal, size(wft, 1), 1), wft; λ=0.01, assignments=ones(UInt8, length(indexes))))
+                    msplit = split(mtest)
 
                     if msplit !== mtest
                         assign = assignments(msplit)
@@ -214,8 +258,8 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
                         assign2 = assign .== 2
                         if sum(assign1) >= params.min_cluster_size && sum(assign2) >= params.min_cluster_size
                             changed = more_iter = true
-                            splitclust = Cluster(wf, indexes[assign1])
-                            newclust = Cluster(wf, indexes[assign2])
+                            splitclust = Cluster(cluster_space, indexes[assign1])
+                            newclust = Cluster(cluster_space, indexes[assign2])
                             if sumabs2(newclust.μ - oldclust.μ) < sumabs2(splitclust.μ - oldclust.μ)
                                 splitclust, newclust = newclust, splitclust
                             end
@@ -248,21 +292,21 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
                         # γ_1[1:length(clust1.indexes)] = 1
                         # γ_2[length(clust1.indexes)+1:end] = 1
                         # mtest = em!(SoftMixtureFit(Mixture(size(wft, 1), 2), wft; λ=0.01, γ=Vector{Float64}[γ_1, γ_2]))
-                        mtest = em!(HardMixtureFit(Mixture(size(wft, 1), 2), wft; λ=0.01,
+                        mtest = em!(HardMixtureFit(Mixture(FullNormal, size(wft, 1), 2), wft; λ=0.01,
                                               assignments=[fill(UInt8(1), length(clust1.indexes)); fill(UInt8(2), length(clust2.indexes))]))
-                        mmerged = merge(mtest, verbose=:op)
+                        mmerged = merge(mtest)
 
                         if mmerged !== mtest
                             changed = more_iter = true
-                            newclust = Cluster(wf, [clust1.indexes; clust2.indexes])
+                            newclust = Cluster(cluster_space, sort!([clust1.indexes; clust2.indexes]))
                             if sumabs2(newclust.μ - clust1.μ) < sumabs2(newclust.μ - clust2.μ)
                                 clusters[iclust1] = newclust
-                                clusters[iclust2].active = false
+                                clust2.active = false
                                 inewclust = iclust1
                                 ideadclust = iclust2
                             else
                                 clusters[iclust2] = newclust
-                                clusters[iclust1].active = false
+                                clust1.active = false
                                 inewclust = iclust2
                                 ideadclust = iclust1
                             end
@@ -280,28 +324,7 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
             end
 
             if params.plot
-                colors = "bgrcmykbgrcmykbgrcmykbgrcmyk"
-                active_indices = find(x->x.active, clusters)
-                active_clusters = clusters[active_indices]
-                nwf = sum(x->length(x.indexes), active_clusters)
-                tmpwf = wf[:, prune_index:ispike-1]
-                pca = fit(PCA, tmpwf, pratio=1.0, maxoutdim=2)
-                pcs = transform(pca, tmpwf)
-
-                clf()
-                bax = subplot2grid((3, length(active_indices)), (0, 0), colspan=length(active_indices))
-                for iclust = 1:length(active_clusters)
-                    inds = find(assignments_[prune_index:ispike-1] .== active_indices[iclust])
-                    sca(bax)
-                    scatter(pcs[1, inds], pcs[2, inds], 1, marker=".", color=string(colors[iclust]))
-                    subplot2grid((3, length(active_indices)), (1, iclust-1))
-                    plot(tmpwf[:, sample(inds, 1000)], color=string(colors[iclust]))
-                    title("Cluster $(active_indices[iclust])")
-                    subplot2grid((3, length(active_indices)), (2, iclust-1))
-                    imshow(active_clusters[iclust].Σ, interpolation="nearest")
-                    colorbar()
-                end
-                draw()
+            	plotclusters(hp, rg, rg_wf, clusters, assignments_, Int(params.history_period))
             end
 
             next_inspect = cur_time+Int(params.inspect_period)
@@ -309,8 +332,8 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
 
         # Find best cluster
         best_cluster = 0
-        best_logpdf = -Inf
-        nspikes = ispike - last_prune_index
+        best_logpdf = unif_ll
+        nspikes = ispike - last_prune_index - 1
         for icluster = 1:length(clusters)
             cluster = clusters[icluster]
             !cluster.active && continue
@@ -324,8 +347,14 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
 
         # Add to cluster
         assignments_[ispike] = best_cluster
-        addspike!(clusters[best_cluster], cur_wf, ispike)
+        if best_cluster != 0
+            addspike!(clusters[best_cluster], cur_wf, ispike)
+        else
+            println("noise encountered")
+        end
     end
+
+    params.plot && finish!(hp)
     assignments_
 end
 

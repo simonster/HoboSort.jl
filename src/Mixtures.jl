@@ -1,17 +1,41 @@
 module Mixtures
 # My own implementation of mixture models (hard and soft, currently Gaussian only) with split-merge EM
-using Distributions, Base.LinAlg, PDMats
+using Distributions, Base.LinAlg, PDMats, StatsBase
 import Base.split, Base.merge
 export Mixture, SoftMixtureFit, HardMixtureFit, em!, fsmem!, split, merge, score, assignments
 
+"""
+    verbose_iter(::Symbol)
+
+Returns true if the verbosity level indicates we should print the log
+likelihood on each iteration.
+"""
 verbose_iter(s::Symbol) = s == :iter
+
+"""
+    verbose_op(::Symbol)
+
+Returns true if the verbosity level indicates we should print
+information about split and merge operations.
+"""
 verbose_op(s::Symbol) = s == :iter || s == :op
+
+"""
+    uninitialized(::Type{D<:Distribution}, d::Int)
+
+Create a new "uninitialized" distribution object of a given
+dimensionality.
+"""
 uninitialized(::Type{FullNormal}, d::Int) =
     FullNormal(Array(Float64, d), PDMat(Array(Float64, d, d), Cholesky{Float64,Matrix{Float64}}(Array(Float64, d, d), 'U')))
+uninitialized(::Type{DiagNormal}, d::Int) =
+    DiagNormal(Array(Float64, d), PDiagMat(Array(Float64, d), Array(Float64, d)))
+
 
 type Mixture{T,C<:Distribution}
     components::Vector{C}
     logπ::Vector{T}
+    noise_pdf::T
 end
 
 Mixture(components::Vector) =
@@ -24,15 +48,12 @@ function Mixture{C<:Distribution}(::Type{C}, d::Int, k::Int)
     Mixture(components)
 end
 Mixture(d::Int, k::Int) = Mixture(FullNormal, d, k)
-Mixture{T,C<:MvNormal}(m::Mixture{T,C}, k::Int) = Mixture(length(m.components[1].μ), k)
-function Mixture{T,C<:MvTDist}(m::Mixture{T,C}, k::Int)
-    components = Array(C, k)
-    c = m.components[1]
-    for i = 1:k
-        chol = Cholesky{T,Matrix{T}}(similar(c.Σ.chol.factors), 'U')
-        components[c] = C(c.df, c.dim, c.zeromean, similar(c.μ), PDMat(similar(c.Σ.mat), chol))
+function Mixture{T,C}(m::Mixture{T,C}, k::Int)
+    components = eltype(m.components)[deepcopy(m.components[i]) for i = 1:min(k, length(m.components))]
+    for i = length(m.components)+1:k
+        push!(components, deepcopy(m.components[end]))
     end
-    Mixture(components)
+    Mixture(components, Array(T, k))
 end
 
 abstract MixtureFit{T,C}
@@ -55,6 +76,10 @@ function initialγ(T::Type, n::Int, k::Int)
 end
 
 function SoftMixtureFit{T}(m::Mixture, X::StridedMatrix{T}; λ::T=convert(T, 0), γ::Vector{Vector{T}}=initialγ(T, size(X, 2), length(m.components)))
+    length(γ) == length(m.components) || throw(DimensionMismatch("length of γ must match number of components"))
+    for i = 1:length(γ)
+        length(γ[i]) == size(X, 2) || throw(DimensionMismatch("length of each element of γ must match number of points"))
+    end
     SoftMixtureFit(m, X, γ, λ, T(-Inf),
                zeros(T, size(X, 2)), zeros(T, size(X, 2)))
 end
@@ -92,6 +117,7 @@ end
 function HardMixtureFit{T}(m::Mixture, X::StridedMatrix{T}; λ::T=convert(T, 0), assignments=rand(UInt8(1):UInt8(length(m.components)), size(X, 2)))
     k = length(m.components)
     k < typemax(UInt8) || throw(ArgumentError("a maximum of $(typemax(UInt8)) components are supported"))
+    length(assignments) == size(X, 2) || throw(DimensionMismatch("number of assignments must match number of points"))
     HardMixtureFit(m, X, assignments, λ, T(-Inf),
                    zeros(T, size(X, 2)), zeros(T, size(X, 2)))
 end
@@ -260,12 +286,24 @@ function estep!{T}(m::Union{HardMixtureFit{T},PartialHardMixtureFit{T}})
     m
 end
 
-function estimate!{D<:MvNormal}(mu::StridedVector{Float64}, C::StridedMatrix{Float64}, ::Type{D}, x::AbstractMatrix{Float64}, w::AbstractVector{Float64})
+function regularize_and_factorize!(c::FullNormal, λ::Real)
+    Σmat = c.Σ.mat
+    if λ != 0
+        for i = diagind(Σmat)
+            Σmat[i] += λ
+        end
+    end
+    copy!(c.Σ.chol.factors, Σmat)
+    LinAlg.chol!(c.Σ.chol.factors, Val{:U})
+    c
+end
+
+function estimate!(c::FullNormal, x::AbstractMatrix{Float64}, w::AbstractVector{Float64}, λ::Real)
     m = size(x, 1)
     n = size(x, 2)
-    length(w) == n || throw(DimensionMismatch("Inconsistent argument dimensions"))
 
     inv_sw = 1.0 / sum(w)
+    mu = c.μ
     Base.LinAlg.BLAS.gemv!('N', inv_sw, x, w, 0.0, mu)
 
     z = Array(Float64, m, n)
@@ -275,15 +313,44 @@ function estimate!{D<:MvNormal}(mu::StridedVector{Float64}, C::StridedMatrix{Flo
             @inbounds z[i,j] = (x[i,j] - mu[i]) * cj
         end
     end
-    LinAlg.copytri!(Base.LinAlg.BLAS.syrk!('U', 'N', inv_sw, z, 0.0, C), 'U')
+    LinAlg.copytri!(Base.LinAlg.BLAS.syrk!('U', 'N', inv_sw, z, 0.0, c.Σ.mat), 'U')
+    regularize_and_factorize!(c, λ)
 end
 
-function estimate!{D<:MvNormal}(mu::StridedVector{Float64}, C::StridedMatrix{Float64}, ::Type{D}, x::AbstractMatrix{Float64})
+function estimate!(c::FullNormal, x::AbstractMatrix{Float64}, λ::Real)
     n = size(x, 2)
-    vec(mean!(mu, x))
+
+    mu = mean!(c.μ, x)
     z = x .- mu
-    Base.LinAlg.BLAS.syrk!('U', 'N', 1/n, z, 0.0, C)
-    Base.LinAlg.copytri!(C, 'U')
+
+    Σmat = c.Σ.mat
+    Base.LinAlg.copytri!(Base.LinAlg.BLAS.syrk!('U', 'N', 1/n, z, 0.0, c.Σ.mat), 'U')
+    regularize_and_factorize!(c, λ)
+end
+
+function regularize_and_factorize!(c::DiagNormal, λ::Real)
+    diag = c.Σ.diag
+    invdiag = c.Σ.inv_diag
+    for i = 1:length(diag)
+        invdiag[i] = inv(diag[i] += λ)
+    end
+    c
+end
+
+function estimate!(c::DiagNormal, x::AbstractMatrix{Float64}, w::AbstractVector{Float64}, λ::Real)
+    m = size(x, 1)
+    n = size(x, 2)
+    wt = weights(w)
+    mu = mean!(c.μ, x, wt, 2)
+    diag = Base.varm!(c.Σ.diag, x, mu, wt, 2)
+    regularize_and_factorize!(c, λ)
+end
+
+function estimate!(c::DiagNormal, x::AbstractMatrix{Float64}, λ::Real)
+    n = size(x, 2)
+    mu = mean!(c.μ, x)
+    diag = Base.varm!(c.Σ.diag, x, mu)
+    regularize_and_factorize!(c, λ)
 end
 
 function mstep!{T,C}(m::Union{SoftMixtureFit{T,C},PartialSoftMixtureFit{T,C}})
@@ -293,16 +360,7 @@ function mstep!{T,C}(m::Union{SoftMixtureFit{T,C},PartialSoftMixtureFit{T,C}})
     for k = 1:length(components)
         # Eq. 9.24 and 9.25
         c = components[k]
-        Σmat = c.Σ.mat
-        estimate!(c.μ, Σmat, C, m.X, γ[k])
-        if m.λ != 0
-            λ = m.λ
-            for i = diagind(Σmat)
-                Σmat[i] += λ
-            end
-        end
-        copy!(c.Σ.chol.factors, Σmat)
-        LinAlg.chol!(c.Σ.chol.factors, Val{:U})
+        estimate!(c, m.X, γ[k], m.λ)
         # Eq. 9.26
         logπ[k] = log(mean(γ[k]))
     end
@@ -315,18 +373,9 @@ function mstep!{T,C}(m::Union{HardMixtureFit{T,C},PartialHardMixtureFit{T,C}})
     for k = 1:length(components)
         # Eq. 9.24 and 9.25
         c = components[k]
-        Σmat = c.Σ.mat
         incomponent = m.assignments .== k
         # TODO inefficient
-        estimate!(c.μ, Σmat, C, m.X[:, incomponent])
-        if m.λ != 0
-            λ = m.λ
-            for i = diagind(Σmat)
-                Σmat[i] += λ
-            end
-        end
-        copy!(c.Σ.chol.factors, Σmat)
-        LinAlg.chol!(c.Σ.chol.factors, Val{:U})
+        estimate!(c, m.X[:, incomponent], m.λ)
         # Eq. 9.26
         logπ[k] = log(mean(incomponent))
     end
@@ -343,6 +392,7 @@ function nparameters(d::FullNormal)
     n = length(d.μ)
     div(n*(n-1), 2)+n
 end
+nparameters(d::DiagNormal) = length(d.μ)*6
 
 function score{T,C<:Union{MvNormal,MvTDist}}(m::MixtureFit{T,C})
     k = length(m.m.components)
@@ -359,18 +409,34 @@ end
 
 Merge components c1 and c2 into out and return new log mixing coefficient
 """
-function merge!{C<:Union{MvTDist,MvNormal}}(out::C, c1::C, logπ1::Real, c2::C, logπ2::Real)
+function merge!{C<:Union{MvTDist,FullNormal}}(out::C, c1::C, logπ1::Real, c2::C, logπ2::Real)
     π1 = exp(logπ1)
     π2 = exp(logπ2)
+
     # Merge μ
     for m = 1:length(c1.μ)
         out.μ[m] = (π1*c1.μ[m] + π2*c2.μ[m])/(π1+π2)
     end
+
     # Merge Σ
     for n = 1:size(c1.Σ.mat, 2), m = 1:size(c2.Σ.mat, 1)
         out.Σ.chol.factors[m, n] = out.Σ.mat[m, n] = (π1*c1.Σ.mat[m, n] + π2*c2.Σ.mat[m, n])/(π1+π2)
     end
     LinAlg.chol!(out.Σ.chol.factors, Val{:U})
+
+    # New log mixing coefficient
+    logsumexp(logπ1, logπ2)
+end
+function merge!(out::DiagNormal, c1::DiagNormal, logπ1::Real, c2::DiagNormal, logπ2::Real)
+    π1 = exp(logπ1)
+    π2 = exp(logπ2)
+
+    # Merge μ and Σ
+    for m = 1:length(c1.μ)
+        out.μ[m] = (π1*c1.μ[m] + π2*c2.μ[m])/(π1+π2)
+        out.Σ.diag[m] = (π1*c1.Σ.diag[m] + π2*c2.Σ.diag[m])/(π1+π2)
+        out.Σ.inv_diag[m] = 1/out.Σ.diag[m]
+    end
 
     # New log mixing coefficient
     logsumexp(logπ1, logπ2)
@@ -490,7 +556,7 @@ drop_degenerate!(m::SoftMixtureFit) = m
 
 Split component c into out1 and out2 and return new log mixing coefficient
 """
-function split!{C<:Union{MvTDist,MvNormal}}(out1::C, out2::C, c::C, logπ::Real)
+function split!{C<:Union{MvTDist,FullNormal}}(out1::C, out2::C, c::C, logπ::Real)
     # Split μ
     ε = scale!(c.Σ.chol.factors'randn(c.Σ.dim), 0.2)
     broadcast!(+, out1.μ, c.μ, ε)
@@ -506,6 +572,24 @@ function split!{C<:Union{MvTDist,MvNormal}}(out1::C, out2::C, c::C, logπ::Real)
         fill!(chol.factors, 0)
         mat[diagind(mat)] = s
         chol.factors[diagind(chol.factors)] = sqrt(s)
+    end
+
+    # New log mixing coefficient
+    logπ - log(2)
+end
+function split!(out1::DiagNormal, out2::DiagNormal, c::DiagNormal, logπ::Real)
+    # Split μ
+    ε = scale!(c.Σ.inv_diag.*randn(c.Σ.dim), 0.5)
+    broadcast!(+, out1.μ, c.μ, ε)
+    broadcast!(-, out2.μ, c.μ, ε)
+
+    # Split Σ
+    q = sum(log(c.Σ.diag))/c.Σ.dim/2
+    s = exp(q)
+    sinv = inv(s)
+    for Σ in (out1.Σ, out2.Σ)
+        copy!(Σ.diag, s)
+        copy!(Σ.inv_diag, sinv)
     end
 
     # New log mixing coefficient
@@ -585,8 +669,7 @@ function em!{T}(m::MixtureFit{T}; tol::T=1e-3, maxiter::Int=200, verbose::Symbol
     m
 end
 
-function fsmem!{T}(X::StridedMatrix; tol::T=1e-3, maxiter::Int=200, verbose::Symbol=:none)
-    m = HardMixtureFit(Mixture(size(X, 1), 10), X; λ=0.01)
+function fsmem!{T}(m::MixtureFit{T}; tol::T=1e-3, maxiter::Int=200, verbose::Symbol=:none)
     verbose_op(verbose) && println("Performing initial EM...")
     em!(m, tol=tol, maxiter=maxiter, verbose=verbose)
     while true

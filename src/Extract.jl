@@ -1,5 +1,5 @@
 module Extract
-using Interpolations, DSP
+using Interpolations, DSP, AxisAlgorithms, SpecialMatrices
 export PositiveThreshold, NegativeThreshold, DoubleThreshold, extract_wf, extract_wf_teo, noise_autocovariance
 
 immutable PositiveThreshold{T<:Real}
@@ -25,69 +25,52 @@ end
 DoubleThreshold(posthr::Real, negthr::Real) = DoubleThreshold{Base.promote_typeof(posthr, negthr)}(posthr, negthr)
 DoubleThreshold(thr::Real) = DoubleThreshold(thr, thr)
 apply_threshold(t::DoubleThreshold, x) = (x >= t.posthr) | (x <= t.negthr)
-function find_alignment_point(t::DoubleThreshold, v::AbstractVector)
-    # Go up to the first zero crossing
-    if v[1] < 0
-        minind = 1
-        minval = v[1]
-        i = 2
-        while i <= length(v)
-            if v[i] <= minval
-                minind = i
-                minval = v[i]
-            elseif v[i] > 0
-                break
-            end
-            i += 1
-        end
-        i += 1
-        i > length(v) && return minind
-        maxind = i
-        maxval = v[i]
-        while i <= length(v)
-            if v[i] >= maxval
-                maxind = i
-                maxval = v[i]
-            elseif v[i] < 0
-                break
-            end
-            i += 1
-        end
-    else
-        maxind = 1
-        maxval = v[1]
-        i = 2
-        while i <= length(v)
-            if v[i] >= maxval
-                maxind = i
-                maxval = v[i]
-            elseif v[i] < 0
-                break
-            end
-            i += 1
-        end
-        i += 1
-        i > length(v) && return maxind
-        minind = i
-        minval = v[i]
-        while i <= length(v)
-            if v[i] <= minval
-                minind = i
-                minval = v[i]
-            elseif v[i] > 0
-                break
-            end
-            i += 1
-        end
+
+function find_closest_extremum(x, istart, dt, firstallowed, lastallowed)
+    irextremum = istart+zero(dt)
+    sgn = sign(x[istart-dt] - x[istart])
+    while irextremum < lastallowed && sign(x[irextremum] - x[irextremum+dt]) == sgn
+        irextremum += dt
     end
-    if maxval > abs(minval)
-        maxind
-    else
-        minind
+    ilextremum = istart+zero(dt)
+    sgn = sign(x[istart+dt] - x[istart])
+    while ilextremum > firstallowed && sign(x[ilextremum] - x[ilextremum-dt]) == sgn
+        ilextremum -= dt
     end
+    (istart - ilextremum) < (irextremum - istart) ? ilextremum : irextremum
 end
 
-function extract_wf(x, thr_type, pre, post, align; upsample::Int=1, aligndur::Int=post, refractory::Int=post)
+
+immutable FastInterpolationUpdater{T,TCoefs,S}
+    interp::Interpolations.BSplineInterpolation{T,1,TCoefs,BSpline{Cubic{Flat}},OnGrid,1}
+    prefiltering_system::S
+    tmp::TCoefs
+end
+
+function FastInterpolationUpdater(x)
+    interp = interpolate(x, BSpline(Cubic(Flat())), OnGrid())
+    prefiltering_system = Interpolations.prefiltering_system(Interpolations.tweight(x), Interpolations.tcoef(x), length(interp.coefs), Cubic{Flat}, OnGrid)
+    FastInterpolationUpdater(interp, prefiltering_system, similar(interp.coefs))
+end
+
+function update_interpolation!(updater::FastInterpolationUpdater, x, rg)
+    interp = updater.interp
+    copy!(interp.coefs, 2:length(rg)+1, x, rg)
+    interp.coefs[1] = interp.coefs[end] = 0
+    W, b = updater.prefiltering_system
+    R1 = R2 = CartesianRange(())
+    dest = src = interp.coefs
+    Interpolations._A_ldiv_B_md!(dest, W.A, src, R1, R2, b)
+    tmp = updater.tmp
+    fill!(tmp, 0)
+    tmp[1] = W.Cp[1,1]*src[3]+W.Cp[1,2]*src[end-2]
+    tmp[end] = W.Cp[2,1]*src[3]+W.Cp[2, 2]*src[end-2]
+    Interpolations._A_ldiv_B_md!(tmp, W.A, tmp, R1, R2)
+    AxisAlgorithms.sub!(dest, tmp)
+    interp
+end
+
+function extract_wf(x, thr_type::Union{PositiveThreshold,NegativeThreshold}, pre, post, align; upsample::Int=1, refractory::Int=post)
     nx = length(x)
     i = pre+1
     nwf = 0
@@ -98,12 +81,9 @@ function extract_wf(x, thr_type, pre, post, align; upsample::Int=1, aligndur::In
         end
         i += 1
     end
-    tmp = zeros(eltype(x), upsample*aligndur+1)
-    if upsample != 1
-        interpolated = interpolate(x, BSpline(Cubic(Flat())), OnGrid())
-    else
-        interpolated = interpolate(zeros(eltype(x), 2), BSpline(Cubic(Flat())), OnGrid())
-    end
+    tmp = zeros(eltype(x), upsample*(pre+post)+1)
+    updater = FastInterpolationUpdater(zeros(eltype(x), 2*pre+2*post+1))
+    interpolated = updater.interp
     wf = zeros(eltype(x), pre+post+1, nwf)
     times = zeros(Int, nwf)
     oldnwf = nwf # Might detect fewer waveforms due to alignment
@@ -113,19 +93,31 @@ function extract_wf(x, thr_type, pre, post, align; upsample::Int=1, aligndur::In
         if apply_threshold(thr_type, x[i])
             nwf += 1
 
+            oldi = -1
             if align
-                if upsample != 1
-                    for isample = 1:upsample*aligndur+1
-                        tmp[isample] = interpolated[i+(isample-1)/upsample]
+                oldi = i
+                for iter = 1:10
+                    if upsample != 1
+                        interp_start = i-pre-post
+                        interp_end = i+pre+post
+                        update_interpolation!(updater, x, interp_start:interp_end)
+                        for isample = 1:upsample*(pre+post+1)
+                            tmp[isample] = interpolated[post+1+(isample-1)/upsample]
+                        end
+                        pt = interp_start+post+1+(find_alignment_point(thr_type, tmp)-1)/upsample
+                        for iwf = 1:pre+post+1
+                            wf[iwf, nwf] = interpolated[pt+iwf-1-pre]
+                        end
+                        i = round(Int, interp_start+pt-1)
+                    else
+                        copy!(tmp, 1, x, i-pre, pre+post+1)
+                        i += find_alignment_point(thr_type, tmp) - 1
                     end
-                    pt = i+(find_alignment_point(thr_type, tmp)-1)/upsample
-                    for iwf = 1:pre+post+1
-                        wf[iwf, nwf] = interpolated[pt+iwf-1-pre]
+
+                    if i == oldi || i < max(initiali - pre, lastspike + refractory)
+                        i = oldi
+                        break
                     end
-                    i = ceil(Int, pt)
-                else
-                    copy!(tmp, 1, x, i, aligndur+1)
-                    i += ceil(Int, find_alignment_point(thr_type, tmp)) - 1
                 end
             end
 
@@ -140,17 +132,6 @@ function extract_wf(x, thr_type, pre, post, align; upsample::Int=1, aligndur::In
             while i <= nx-post && apply_threshold(thr_type, x[i])
                 i += 1
             end
-
-            # Do not allow a lower point than the alignment point in
-            # the waveform, since that is a sign that this is doubled
-            lowerpt = false
-            for iwf = 1:pre+post+1
-                lowerpt = lowerpt || (apply_threshold(thr_type, wf[iwf, nwf]) && abs(wf[iwf, nwf]) > abs(wf[pre+1, nwf]))
-            end
-            if lowerpt
-                nwf -= 1
-                continue
-            end
         end
         i += 1
     end
@@ -161,60 +142,7 @@ function extract_wf(x, thr_type, pre, post, align; upsample::Int=1, aligndur::In
     wf, times
 end
 
-function compute_mteo(x, ks)
-    tmp = zeros(eltype(x), length(x)+2*maximum(ks))
-    out = zeros(eltype(x), length(x))
-    @inbounds for ik = 1:length(ks)
-        k = ks[ik]
-        # Compute TEO
-        @simd for i = k+1:length(x)-k
-            tmp[i] = abs2(x[i]) - x[i-k]*x[i+k]
-        end
-
-        # Apply Hamming window filter
-        h = hamming(4*k+1)
-        h /= sqrt(3*sumabs2(h)+sum(h)^2) # Eq. (13)
-        filt!(tmp, h, tmp)
-
-        # Compute output
-        @simd for i = 1:length(x)
-            out[i] = max(out[i], tmp[i+2k])
-        end
-    end
-    out
-end
-
-function find_closest_extremum(x, istart, dt)
-    irextremum = istart+zero(dt)
-    rextremum = abs(x[istart])
-    while irextremum < length(x) && abs(x[irextremum+dt]) > rextremum && sign(x[irextremum+dt]) == sign(rextremum)
-        irextremum += dt
-        rextremum = abs(x[irextremum])
-    end
-    ilextremum = istart+zero(dt)
-    lextremum = abs(x[istart])
-    while ilextremum > 1 && abs(x[ilextremum-dt]) > lextremum && sign(x[ilextremum-dt]) == sign(lextremum)
-        ilextremum -= dt
-        lextremum = abs(x[ilextremum])
-    end
-    pt = lextremum > rextremum ? ilextremum : irextremum
-end
-
-# function find_closest_extremum(x, istart, dt)
-#     irextremum = istart+zero(dt)
-#     sgn = sign(x[istart-dt] - x[istart])
-#     while irextremum < length(x) && sign(x[irextremum] - x[irextremum+dt]) == sgn
-#         irextremum += dt
-#     end
-#     ilextremum = istart+zero(dt)
-#     sgn = sign(x[istart+dt] - x[istart])
-#     while ilextremum > 1 && sign(x[ilextremum] - x[ilextremum-dt]) == sgn
-#         ilextremum -= dt
-#     end
-#     pt = (istart - ilextremum) < (irextremum - istart) ? ilextremum : irextremum
-# end
-
-function extract_wf_teo(x, thr_type, pre, post, align; upsample::Int=1, aligndur::Int=post, refractory::Int=post)
+function extract_wf(x, thr_type::DoubleThreshold, pre, post, align; upsample::Int=1, refractory::Int=post)
     nx = length(x)
     i = pre+1
     nwf = 0
@@ -225,62 +153,93 @@ function extract_wf_teo(x, thr_type, pre, post, align; upsample::Int=1, aligndur
         end
         i += 1
     end
-    mteo = compute_mteo(x, (1, 4, 7, 10, 13, 16))
-    tmp = zeros(eltype(x), upsample*aligndur+1)
-    if upsample != 1
-        interpolated = interpolate(x, BSpline(Cubic(Flat())), OnGrid())
-    else
-        interpolated = interpolate(zeros(eltype(x), 2), BSpline(Cubic(Flat())), OnGrid())
-    end
+    updater = FastInterpolationUpdater(zeros(eltype(x), 2*pre+2*post+1))
     wf = zeros(eltype(x), pre+post+1, nwf)
     times = zeros(Int, nwf)
+    grad = zeros(eltype(x), 1)
     oldnwf = nwf # Might detect fewer waveforms due to alignment
     nwf = 0
+    lastspike = 0
     i = pre+1
+    interpolated = updater.interp
+    extrema = Tuple{Float64,eltype(x)}[]
     while i <= nx-post
         if apply_threshold(thr_type, x[i])
             nwf += 1
 
             if align
-                # First find (first) peak of TEO
-                imaxteo = i
-                while imaxteo < i+aligndur && mteo[imaxteo+1] > mteo[imaxteo]
-                    imaxteo += 1
-                end
-
-                # Now find closest local extremum
-                if upsample != 1
-                    pt = find_closest_extremum(interpolated, imaxteo, 1/upsample)
-                    for iwf = 1:pre+post+1
-                        wf[iwf, nwf] = interpolated[pt+iwf-1-pre]
+                initiali = i
+                pt = 1/one(upsample)
+                # Find the local extremum that corresponds to the highest TEO
+                best = -Inf
+                secondbest = -Inf
+                for iter = 1:10 
+                    oldi = i
+                    interp_start = i-pre-post
+                    interp_end = i+pre+post
+                    update_interpolation!(updater, x, interp_start:interp_end)
+                    empty!(extrema)
+                    npos = 0
+                    nneg = 0
+                    for iext = post+1:1/upsample:2*post+pre+1
+                        v = interpolated[iext]
+                        !apply_threshold(thr_type, v) && continue
+                        gradient!(grad, interpolated, iext-1/(2*upsample))
+                        g1 = grad[1]
+                        gradient!(grad, interpolated, iext+1/(2*upsample))
+                        g2 = grad[1]
+                        if sign(g1) != sign(g2)
+                            push!(extrema, (iext, v))
+                            if v > 0
+                                npos += 1
+                            else
+                                nneg += 1
+                            end
+                        end
                     end
-                    i = ceil(Int, pt)
-                else
-                    i = find_closest_extremum(x, imaxteo, 1)
-                end
-            end
+                    if npos == 1 && nneg > 1
+                        # If multiple extrema on one side but only one on another, use the one
+                        for (iext, v) in extrema
+                            if v > 0
+                                pt = iext
+                                break
+                            end
+                        end
+                    elseif nneg >= 1
+                        # Use largest negative threshold crossing
+                        mext = 0.0
+                        for (iext, v) in extrema
+                            if v < mext
+                                pt = iext
+                                mext = v
+                            end
+                        end
+                    else
+                        # Use the first positive crossing
+                        pt = extrema[1][1]
+                    end
 
-            if !align || upsample == 1
+                    i = round(Int, interp_start+pt-1)
+                    if i == oldi || i < max(initiali - pre, lastspike + refractory)
+                        i = oldi
+                        break
+                    end
+                end
+
                 for iwf = 1:pre+post+1
-                    wf[iwf, nwf] = mteo[i+iwf-1-pre]
+                    wf[iwf, nwf] = interpolated[pt+iwf-1-pre]
+                end
+            else
+                for iwf = 1:pre+post+1
+                    wf[iwf, nwf] = x[i+iwf-1-pre]
                 end
             end
 
+            lastspike = i
             times[nwf] = i
-            i += refractory - 1
+            i += refractory
             while i <= nx-post && apply_threshold(thr_type, x[i])
                 i += 1
-            end
-
-            # Do not allow a lower point than the alignment point in
-            # the waveform, since that is a sign that this is doubled
-            lowerpt = false
-            for iwf = 1:pre+post+1
-                lowerpt = lowerpt || (apply_threshold(thr_type, wf[iwf, nwf]) && abs(wf[iwf, nwf]) > abs(wf[pre+1, nwf]))
-            end
-            if lowerpt
-                nwf -= 1
-                continue
             end
         end
         i += 1
@@ -289,7 +248,7 @@ function extract_wf_teo(x, thr_type, pre, post, align; upsample::Int=1, aligndur
         wf = wf[:, 1:nwf]
         resize!(times, nwf)
     end
-    wf, times
+    wf, #=wfteo, extrema,=# times
 end
 
 # Find segments of noise suitably far from a spike
@@ -312,5 +271,7 @@ function noise_autocovariance(x, thr_type, n, gap)
     end
     acov./acovn
 end
+
+whiten(fwf, acov) = sqrtm(full(Toeplitz([reverse(acov[2:end]); acov])))\fwf
 
 end # module
