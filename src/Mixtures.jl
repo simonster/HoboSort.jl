@@ -31,11 +31,9 @@ uninitialized(::Type{FullNormal}, d::Int) =
 uninitialized(::Type{DiagNormal}, d::Int) =
     DiagNormal(Array(Float64, d), PDiagMat(Array(Float64, d), Array(Float64, d)))
 
-
 type Mixture{T,C<:Distribution}
     components::Vector{C}
     logπ::Vector{T}
-    noise_pdf::T
 end
 
 Mixture(components::Vector) =
