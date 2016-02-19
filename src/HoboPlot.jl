@@ -65,12 +65,11 @@ immutable HoboPlotter
     end
 end
 
-function plotclusters(hp::HoboPlotter, rg, rg_wf, clusters, assignments_, time)
-    cluster_colors = "bgrcmykbgrcmykbgrcmykbgrcmyk"
+function plotclusters(hp::HoboPlotter, rg_wf, assignments_, time)
+    cluster_colors = "bgrcmykbgrcmykbgrcmykbgrcmykbgrcmykbgrcmykbgrcmykbgrcmyk"
     colordict = mpl_colors.ColorConverter[:colors]
-    active_indices = find(x->x.active, clusters)
-    active_clusters = clusters[active_indices]
-    nwf = sum(x->length(x.indexes), active_clusters)
+    active_indices = sort(unique(assignments_))
+    cluster_indices = [find(assignments_ .== active_indices[i]) for i = 1:length(active_indices)]
     pca = fit(PCA, rg_wf, pratio=1.0, maxoutdim=2)
     proj = projection(pca)
     for i = 1:size(proj, 2)
@@ -82,19 +81,16 @@ function plotclusters(hp::HoboPlotter, rg, rg_wf, clusters, assignments_, time)
     pcs = transform(pca, rg_wf)
 
     clf()
-    bax = subplot2grid((3, length(active_indices)), (0, 0), colspan=length(active_indices))
-    for iclust = 1:length(active_clusters)
-        cluster_color = string(cluster_colors[iclust])
-        inds = find(sub(assignments_, rg) .== active_indices[iclust])
+    bax = subplot2grid((2, length(active_indices)), (0, 0), colspan=length(active_indices))
+    for iclust = 1:length(active_indices)
+        cluster_color = string(cluster_colors[active_indices[iclust]+1])
+        inds = cluster_indices[iclust]
         sca(bax)
         scatter(pcs[1, inds], pcs[2, inds], 1, marker=".", color=cluster_color)
-        subplot2grid((3, length(active_indices)), (1, iclust-1))
+        subplot2grid((2, length(active_indices)), (1, iclust-1))
         densitymap(sub(rg_wf, :, inds), cmap=linearcmap(colordict[cluster_color]))
         hz = @sprintf("%0.1f", length(inds)/time)
         title("Cluster $(active_indices[iclust]) ($hz Hz)")
-        subplot2grid((3, length(active_indices)), (2, iclust-1))
-        imshow(active_clusters[iclust].Σ, interpolation="nearest")
-        colorbar()
     end
     draw()
     if hp.movie_writer !== nothing
