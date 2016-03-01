@@ -1,8 +1,8 @@
 module HoboPlot
-using PyPlot, PyCall, MultivariateStats, Interpolations
+using PyPlot, PyCall, MultivariateStats, Interpolations, GraphViz
 @pyimport matplotlib.colors as mpl_colors
 @pyimport matplotlib.animation as mpl_animation
-export HoboPlotter, plotclusters, finish!
+export HoboPlotter, plotclusters, writegraph, finish!
 
 function gca_size_pixels()
     bbox = gca()[:get_window_extent]()[:transformed](gcf()[:dpi_scale_trans][:inverted]())
@@ -54,7 +54,7 @@ end
 immutable HoboPlotter
     movie_writer
     function HoboPlotter(movie_file)
-        figure(figsize=(14, 8))
+        figure(figsize=(18, 8))
         if movie_file != ""
             writer = mpl_animation.FFMpegWriter(fps=2, bitrate=10000, extra_args=["-vcodec", "png"])
             writer[:setup](gcf(), movie_file, gcf()[:dpi])
@@ -96,6 +96,19 @@ function plotclusters(hp::HoboPlotter, rg_wf, assignments_, time)
     if hp.movie_writer !== nothing
         hp.movie_writer[:grab_frame]()
     end
+end
+
+function writegraph(graphfile::AbstractString, connections::Vector{Tuple{Int,Int}}, nclusters::Int)
+    g = Graph("""
+    digraph hobograph {
+        init [label="Initial Clustering"]
+        $(join(["init->$i" for i = 1:nclusters], "\n"))
+        $(join(["$i->$j" for (i, j) in connections], "\n"))
+    }
+    """)
+    f = open(graphfile, "w")
+    writemime(f, MIME"image/png"(), g)
+    close(f)
 end
 
 finish!(hp::HoboPlotter) = hp.movie_writer != nothing && hp.movie_writer[:finish]()

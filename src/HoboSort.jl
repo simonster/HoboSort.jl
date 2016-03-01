@@ -14,18 +14,21 @@ immutable SortParams
     merge_score_improvement::Float64
     min_cluster_size::Int
     initial_clusters::Int
+    rerun_em::Bool
     verbose::Bool
     plot::Bool
     movie_file::UTF8String
+    graph_file::UTF8String
 end
 SortParams(; init_period::TimePeriod=Minute(10), inspect_period::TimePeriod=Minute(5),
            history_period::TimePeriod=Minute(10), min_separation_periods::Int=6,
            merge_score_improvement::Real=0, split_score_improvement::Real=0,
-           min_cluster_size::Integer=180, initial_clusters::Integer=10,
-           verbose::Bool=false, plot::Bool=false, movie_file::AbstractString="") =
+           min_cluster_size::Integer=120, initial_clusters::Integer=10, rerun_em::Bool=true,
+           verbose::Bool=false, plot::Bool=false, movie_file::AbstractString="",
+           graph_file::AbstractString="") =
 	SortParams(init_period, inspect_period, history_period, min_separation_periods,
                split_score_improvement, merge_score_improvement,
-               min_cluster_size, initial_clusters, verbose, plot, movie_file)
+               min_cluster_size, initial_clusters, rerun_em, verbose, plot, movie_file, graph_file)
 
 function fit_tdist{T}(X::AbstractMatrix{T}, ν;
                       maxiter::Int=100, tol=1e-3, μ_init::Vector{T}=vec(mean(X, 2)),
@@ -64,6 +67,7 @@ type Cluster{T,S<:AbstractMatrix}
     active::Bool
     first_appeared::Int
     split_from::Int
+    separation::Vector{T}
     wf::S
     η::Vector{T}
     sumη::T
@@ -75,7 +79,7 @@ type Cluster{T,S<:AbstractMatrix}
     scratch::Vector{T}
 end
 
-function Cluster{T}(ν::T, wf::AbstractMatrix{T}, indexes::Vector{Int}, first_appeared::Int, split_from::Int)
+function Cluster{T}(ν::T, wf::AbstractMatrix{T}, indexes::Vector{Int}, first_appeared::Int, split_from::Int=-1)
 	@assert issorted(indexes)
     n = length(indexes)
     cluster_wf = wf[:, indexes]
@@ -83,7 +87,7 @@ function Cluster{T}(ν::T, wf::AbstractMatrix{T}, indexes::Vector{Int}, first_ap
     dist, η = fit_tdist(cluster_wf, ν)
     sumη = sum(η)
 
-    Cluster(true, first_appeared, split_from, wf, η, sumη, dist.μ*sumη, dist.Σ.mat*sumη,
+    Cluster(true, first_appeared, split_from, T[], wf, η, sumη, dist.μ*sumη, dist.Σ.mat*sumη,
             Cholesky{T,Matrix{T}}(dist.Σ.chol.factors*sqrt(sumη), 'U'),
             indexes, dist, zeros(T, size(wf, 1)))
 end
@@ -197,6 +201,75 @@ function prune!{T}(cluster::Cluster{T}, before::Int)
     updatedist!(cluster)
 end
 
+function active_cluster_indexes(clusters)
+    active_clusters = Int[]
+    for icluster = 1:length(clusters)
+        if clusters[icluster].active
+            push!(active_clusters, icluster)
+        end
+    end
+    active_clusters
+end
+
+function mixture_model_from_clusters(clusters, X, λ)
+    dists = MvTDist[cluster.dist for cluster in clusters]
+    logπ = Float64[length(cluster.indexes) for cluster in clusters]
+    nspikes = sum(logπ)
+    for i = 1:length(clusters)
+        logπ[i] = log(logπ[i]/nspikes)
+    end
+    TMixture(dists, X; logπ=logπ, λ=λ, fix_ν=true, use_uniform=false)
+end
+
+function cluster_separation(clusters, X, λ)
+    m = mixture_model_from_clusters(clusters, X, λ)
+    γ = Mixtures.computeγ(m)
+    s = zeros(length(clusters), length(clusters))
+    n = zeros(Int, length(clusters), length(clusters))
+
+    # This is only approximately right, since it's not necessarily
+    # _exactly_ the cluster the spike is in, but should be close enough
+    ass = zeros(Int, size(X, 2))
+    maxes = fill(-Inf, size(X, 2))
+    for k = 1:length(clusters)
+        for i = 1:length(ass)
+            if γ[i, k] > maxes[i]
+                ass[i] = k
+                maxes[i] = γ[i, k]
+            end
+        end
+    end
+
+    for j = 1:length(clusters), i = 1:length(ass)
+        icluster = ass[i]
+        s[icluster, j] += γ[i, j]
+        n[icluster, j] += 1
+    end
+    s./n
+end
+
+function check_when_split_from(clusters, cluster, split_from)
+    while cluster.split_from != -1
+        @show cluster.split_from
+        if cluster.split_from == split_from
+            return cluster.first_appeared
+        end
+        cluster = clusters[cluster.split_from]
+    end
+    return -1
+end
+
+immutable SplitAction
+    oldcluster::Int
+    newcluster::Int
+    iinspect::Int
+end
+immutable MergeAction
+    deadcluster::Int
+    targetcluster::Int
+    iinspect::Int
+end
+
 using PyPlot
 function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
     λ = 1e-6
@@ -207,29 +280,35 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
     pca_in = similar(wf)
     rg = 1:searchsortedlast(times, first(times)+Int(params.history_period))
     s = sum(sub(wf, :, rg), 2)
-    smax = maxabs(s)
-    clf()
-    n = length(rg)
-    for j = rg, k = 1:size(wf, 1)
-        pca_in[k, j] = (wf[k, j]*n-s[k])/smax
-    end
+    pca_in[:, rg] = sub(wf, :, rg) .- s/length(rg)
+    v = sumabs2(sub(pca_in, :, rg))
+    scale!(sub(pca_in, :, rg), length(rg)/v)
     cur_first = 1
+    n = length(rg)
     for j = last(rg)+1:size(wf, 2)
         last_index = searchsortedlast(times, times[j]-Int(params.history_period))
         while cur_first < last_index
             for k = 1:size(wf, 1)
-                s[k] -= wf[k, cur_first]
+                c = wf[k, cur_first]
+                olds = s[k]
+                news = s[k] -= c
+                v -= (c - olds/n)*(c - news/(n-1))
             end
+            n -= 1
             cur_first += 1
         end
-        n = j-cur_first+1
         for k = 1:size(wf, 1)
-            s[k] += wf[k, j]
+            c = wf[k, j]
+            olds = s[k]
+            news = s[k] += c
+            v += (c - olds/n)*(c - news/(n+1))
         end
-        smax = maxabs(s)
         for k = 1:size(wf, 1)
-            pca_in[k, j] = (wf[k, j]*n-s[k])/smax
+            pca_in[k, j] = ((n+1)*wf[k, j] - s[k])/v
         end
+        # @assert isapprox(s, sum(sub(wf, :, last_index:j), 2))
+        # @assert isapprox(v, sumabs2(sub(wf, :, last_index:j) .- mean(sub(wf, :, last_index:j), 2)))
+        n += 1
     end
     C = Base.covzm(pca_in, vardim=2)
     vals, vecs = eig(Symmetric(C))
@@ -260,7 +339,7 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
     init_rg = 1:searchsortedlast(times, first(times)+Int(params.init_period))
     init_wft = cluster_space[:, init_rg]
     m = TMixture(params.initial_clusters, init_wft; λ=λ, use_uniform=true)::TMixture{T,Matrix{T}}
-    m = fsmem!(m, maxiter=500)::TMixture{T,Matrix{T}}
+    m = fsmem!(m, maxiter=500, verbose=:op)::TMixture{T,Matrix{T}}
 
     # Drop clusters that are too small
     assignments_ = assignments(m)
@@ -268,12 +347,12 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
     ν = m.components[1].df
     verbose && println("Using $init_nclusters clusters")
     counts = hist(assignments_, 0:init_nclusters)[2]
+    verbose && println("Cluster counts: $counts")
     valid = counts .>= params.min_cluster_size
     if !all(valid)
-        # Drop low-count clusters
-        remap = zeros(Int, init_nclusters)
-        remap[valid] = 1:sum(valid)
-        assignments_ = remap[assignments_]
+        remap = zeros(Int, init_nclusters+1)
+        remap[find(valid)+1] = 1:sum(valid)
+        assignments_ = [remap[x+1] for x in assignments_]
         init_nclusters = sum(valid)
         verbose && println("Dropping $(sum(!valid)) clusters with fewer than $(params.min_cluster_size) spikes")
     end
@@ -284,7 +363,7 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
     clusters = Array(Cluster{T,typeof(cluster_space)}, init_nclusters)
     for icluster = 1:length(clusters)
         indexes = find(assignments_ .== icluster)
-        clusters[icluster] = Cluster(ν, cluster_space, indexes, 1, -1)
+        clusters[icluster] = Cluster(ν, cluster_space, indexes, 1)
     end
 
     noise_indexes = find(assignments_ .== 0)+1
@@ -295,6 +374,8 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
         plotclusters(hp, wf[:, init_rg], sub(assignments_, init_rg), Int(params.history_period))
     end
 
+    connections = Tuple{Int,Int}[]
+    connections_time = Tuple{ASCIIString,ASCIIString}[]
 
     iinspect = 0
     next_inspect = zero(eltype(times))
@@ -316,75 +397,36 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
             println("Inspecting...")
             iinspect += 1
             rg = last_prune_index+1:ispike-1
-            rg_wf = wf[:, rg]
-            rg_wft = cluster_space[:, rg]
+            sep_rg = rg[assignments_[rg] .!= 0]
+            sep_wft = cluster_space[:, sep_rg]
 
-            active_clusters = Int[]
-            for icluster = 1:length(clusters)
-                if clusters[icluster].active
-                    push!(active_clusters, icluster)
+            if params.rerun_em
+                active_clusters = active_cluster_indexes(clusters)
+                m = mixture_model_from_clusters(clusters[active_clusters], sep_wft, λ)
+                em!(m)
+                for icluster = 1:length(active_clusters)
+                    cluster = clusters[active_clusters[icluster]]
+                    indexes = sep_rg[assignments(m) .== icluster]
+                    assignments_[indexes] = active_clusters[icluster]
+                    cluster.indexes = indexes
+                    if length(indexes) < 2*size(cluster_space, 1)
+                        println("Cluster $(active_clusters[icluster]) deactivated by EM")
+                        cluster.active = false
+                    else
+                        refit!(cluster)
+                    end
+                end
+            else
+                for icluster = 1:length(clusters)
+                    !clusters[icluster].active && continue
+                    refit!(clusters[icluster])
                 end
             end
-            dists = MvTDist[clusters[icluster].dist for icluster in active_clusters]
-            logπ = Float64[length(clusters[icluster].indexes) for icluster in active_clusters]
-            nspikes = sum(logπ)
-            for i = 1:length(logπ)
-                logπ[i] = log(logπ[i]/nspikes)
-            end
-            refit_rg = rg[assignments_[rg] .!= 0]
-            m = TMixture(dists, cluster_space[:, refit_rg]; logπ=logπ, λ=λ, fix_ν=true, use_uniform=false)
-            em!(m)
-            for icluster = 1:length(active_clusters)
-                cluster = clusters[active_clusters[icluster]]
-                cluster.indexes = refit_rg[assignments(m) .== icluster]
-                refit!(cluster)
-            end
 
-            if params.plot
-                plotclusters(hp, rg_wf, sub(assignments_, rg), Int(params.history_period))
-            end
-
-            # Try splitting clusters
             changed = false
             more_iter = true
             while more_iter
                 more_iter = false
-                for icluster = 1:length(clusters)
-                    oldclust = clusters[icluster]
-                    indexes = oldclust.indexes
-                    !oldclust.active && continue
-                    length(indexes) <= params.min_cluster_size && continue
-                    wft = rg_wft[:, findin(rg, indexes)]
-
-                    ll = refit!(oldclust)
-                    mtest = em!(TMixture(typeof(oldclust.dist)[deepcopy(oldclust.dist)], wft; λ=λ, fix_ν=true, use_uniform=false))
-                    msplit = split(mtest)
-
-                    if msplit !== mtest && (score(msplit) - score(mtest)) > params.split_score_improvement
-                        assign = assignments(msplit)
-                        assign1 = assign .== 1
-                        assign2 = assign .== 2
-                        if sum(assign1) >= params.min_cluster_size && sum(assign2) >= params.min_cluster_size
-                            changed = more_iter = true
-                            if maxabs(msplit.components[1].μ) < maxabs(msplit.components[2].μ)
-                                splitclust = Cluster(ν, cluster_space, indexes[assign1], iinspect, oldclust.split_from)
-                                newclust = Cluster(ν, cluster_space, indexes[assign2], iinspect, icluster)
-                            else
-                                splitclust = Cluster(ν, cluster_space, indexes[assign2], iinspect, oldclust.split_from)
-                                newclust = Cluster(ν, cluster_space, indexes[assign1], iinspect, icluster)
-                            end
-                            clusters[icluster] = splitclust
-                            push!(clusters, newclust)
-                            assignments_[newclust.indexes] = length(clusters)
-                            if verbose
-                                println("Splitting cluster $icluster")
-                                println("    new cluster $(length(clusters)) has $(length(newclust.indexes)) waveforms")
-                                println("    old cluster $(icluster) has $(length(splitclust.indexes)) waveforms")
-                                println("    score $(score(mtest)) -> $(score(msplit))")
-                            end
-                        end
-                    end
-                end
 
                 # Try merging clusters
                 for iclust1 = 1:length(clusters)
@@ -393,11 +435,7 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
                     for iclust2 = iclust1+1:length(clusters)
                         clust2 = clusters[iclust2]
                         !clust2.active && continue
-
-                        ind1 = findin(rg, clust1.indexes)
-                        ind2 = findin(rg, clust2.indexes)
-                        rgindexes = [ind1; ind2]
-                        wft = rg_wft[:, rgindexes]
+                        indexes = [clust1.indexes; clust2.indexes]
 
                         # mix = Mixture([MvTDist(10., clust1.μ, deepcopy(clust1.Σ)),
                         #                MvTDist(10., clust2.μ, deepcopy(clust2.Σ))])
@@ -408,14 +446,17 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
                         # mtest = em!(SoftMixtureFit(mix, wft; λ=0.01, γ=Vector{Float64}[γ_1, γ_2]))
                         # mtest = em!(HardMixtureFit(mix, wft; λ=λ,
                         #                       assignments=[fill(UInt8(1), length(clust1.indexes)); fill(UInt8(2), length(clust2.indexes))]))
-                        mtest = em!(TMixture(typeof(clust1.dist)[deepcopy(clust1.dist), deepcopy(clust2.dist)], wft;
-                                    λ=λ, logπ=[log(length(ind1)/length(rgindexes)), log(length(ind2)/length(rgindexes))], fix_ν=true, use_uniform=false))
+                        mtest = em!(TMixture(typeof(clust1.dist)[deepcopy(clust1.dist), deepcopy(clust2.dist)], cluster_space[:, indexes];
+                                    λ=λ, logπ=[log(length(clust1.indexes)/length(indexes)), log(length(clust2.indexes)/length(indexes))],
+                                    fix_ν=true, use_uniform=false))
                         mmerged = merge(mtest)
 
                         if mmerged !== mtest && (score(mmerged) - score(mtest)) > params.merge_score_improvement
                             changed = more_iter = true
-                            newclust = Cluster(ν, cluster_space, sort!([clust1.indexes; clust2.indexes]), iinspect, -1)
-                            if maxabs(clust1.dist.μ) < maxabs(clust2.dist.μ)
+                            newclust = Cluster(ν, cluster_space, sort!([clust1.indexes; clust2.indexes]), iinspect)
+                            sep1 = maximum(keepvecs'*(abs(clust1.dist.μ) - sqrt(diag(clust1.dist.Σ))))
+                            sep2 = maximum(keepvecs'*(abs(clust2.dist.μ) - sqrt(diag(clust2.dist.Σ))))
+                            if sep2 < sep1
                                 clusters[iclust1] = newclust
                                 clust2.active = false
                                 inewclust = iclust1
@@ -429,17 +470,20 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
                             assignments_[clusters[ideadclust].indexes] = inewclust
                             if verbose
                                 println("Merging cluster $ideadclust into $inewclust")
-                                println("    cluster $iclust1 (split from $(clust1.split_from)) had $(length(clust1.indexes)) waveforms")
-                                println("    cluster $iclust2 (split from $(clust2.split_from)) had $(length(clust2.indexes)) waveforms")
+                                println("    cluster $iclust1 (split from $(clust1.split_from)) had $(length(clust1.indexes)) waveforms with mean separation $(sep1)")
+                                println("    cluster $iclust2 (split from $(clust2.split_from)) had $(length(clust2.indexes)) waveforms with mean separation $(sep2)")
                                 println("    score $(score(mtest)) -> $(score(mmerged))")
                             end
-                            if clust1.split_from == iclust2 || clust2.split_from == iclust1
-                                if clust1.split_from == iclust2
-                                    split_periods = iinspect - clust1.first_appeared
+                            push!(connections, (ideadclust,inewclust))
+                            clust1_split_from_clust2 = check_when_split_from(clusters, clust1, iclust2)
+                            clust2_split_from_clust1 = check_when_split_from(clusters, clust2, iclust1)
+                            if clust1_split_from_clust2 != -1 || clust2_split_from_clust1 != -1
+                                if clust1_split_from_clust2 != -1
+                                    split_periods = iinspect - clust1_split_from_clust2
                                     ioriginal = iclust2
                                     isplit = iclust1
                                 else
-                                    split_periods = iinspect - clust2.first_appeared
+                                    split_periods = iinspect - clust2_split_from_clust1
                                     ioriginal = iclust1
                                     isplit = iclust2
                                 end
@@ -453,6 +497,96 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
                         end
                     end
                 end
+
+                # Try splitting clusters
+                for icluster = 1:length(clusters)
+                    oldclust = clusters[icluster]
+                    indexes = oldclust.indexes
+                    !oldclust.active && continue
+                    length(indexes) <= params.min_cluster_size && continue
+
+                    mtest = em!(TMixture(typeof(oldclust.dist)[deepcopy(oldclust.dist)], cluster_space[:, indexes]; λ=λ, fix_ν=true, use_uniform=false))
+                    msplit = split(mtest)
+
+                    if msplit !== mtest && (score(msplit) - score(mtest)) > params.split_score_improvement
+                        assign = assignments(msplit)
+                        assign1 = assign .== 1
+                        assign2 = assign .== 2
+                        cluster1_large_enough = sum(assign1) >= params.min_cluster_size
+                        cluster2_large_enough = sum(assign2) >= params.min_cluster_size
+                        changed = more_iter = true
+                        if cluster1_large_enough && cluster2_large_enough
+
+                            # Compute separation for new clusters
+                            active_clusters = active_cluster_indexes(clusters)
+                            deleteat!(active_clusters, findfirst(active_clusters, icluster))
+                            splitclust = Cluster(ν, cluster_space, indexes[assign1], iinspect)
+                            newclust = Cluster(ν, cluster_space, indexes[assign2], iinspect)
+                            seps = cluster_separation([splitclust; newclust; clusters[active_clusters]], sep_wft, λ)
+
+                            splitsep = -sum(seps[1, 3:end])
+                            newsep = -sum(seps[2, 3:end])
+                            if splitsep > newsep
+                                # The new cluster should be the better separated of the two
+                                splitclust, newclust = newclust, splitclust
+                                splitsep, newsep = newsep, splitsep
+                            end
+                            splitclust.split_from = oldclust.split_from
+                            newclust.split_from = icluster
+
+
+                            for i = 1:length(indexes)
+                            end
+
+                            clusters[icluster] = splitclust
+                            push!(clusters, newclust)
+                            assignments_[newclust.indexes] = length(clusters)
+                            push!(connections, (icluster,length(clusters)))
+                            if verbose
+                                println("Splitting cluster $icluster")
+                                println("    new cluster $(length(clusters)) has $(length(newclust.indexes)) waveforms with mean separation $(newsep)")
+                                println("    old cluster $(icluster) has $(length(splitclust.indexes)) waveforms with mean separation $(splitsep)")
+                                println("    score $(score(mtest)) -> $(score(msplit))")
+                            end
+                        else
+                            if !cluster1_large_enough && !cluster2_large_enough
+                                # Deactivate original cluster
+                                noise_idx = oldclust.indexes
+                                oldclust.active = false
+                                if verbose
+                                    println("Cluster $icluster is small but beneficial to split further; assigning to noise")
+                                end
+                            else
+                                if cluster1_large_enough
+                                    oldclust.indexes = indexes[assign1]
+                                    noise_idx = indexes[assign2]
+                                    append!(noise_indexes, noise_idx)
+                                elseif cluster2_large_enough
+                                    oldclust.indexes = indexes[assign2]
+                                    noise_idx = indexes[assign1]
+                                    append!(noise_indexes, noise_idx)
+                                end
+                                if verbose
+                                    println("Assigning $(length(noise_idx)) spikes from $icluster to noise")
+                                end
+                            end
+                            assignments_[noise_idx] = 0
+                            append!(noise_indexes, noise_idx)
+                            sort!(noise_indexes)
+                        end
+                    end
+                end
+            end
+
+            # Add separation to the cluster info
+            active_clusters = active_cluster_indexes(clusters)
+            seps = cluster_separation(clusters[active_clusters], sep_wft, λ)
+            for i = 1:length(active_clusters)
+                push!(clusters[active_clusters[i]].separation, seps[i, i])
+            end
+
+            if params.plot
+                plotclusters(hp, wf[:, rg], sub(assignments_, rg), Int(params.history_period))
             end
 
             next_inspect = cur_time+Int(params.inspect_period)
@@ -483,7 +617,11 @@ function spikesort{T}(wf::AbstractMatrix{T}, times::Vector, params::SortParams)
         end
     end
 
+    @show connections
     params.plot && finish!(hp)
+    if params.graph_file != ""
+        writegraph(params.graph_file, connections, init_nclusters)
+    end
     assignments_
 end
 
